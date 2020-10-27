@@ -123,6 +123,9 @@ When one supplies long data for a placeholder:
 #include "transaction.h"                        // trans_rollback_implicit
 #include "wsrep_mysqld.h"
 
+/* Constants defining bits in parameter type flags. Flags are read from high byte of short value */
+static const uint parameter_flag_unsigned = 128U << 8;
+
 /**
   A result class used to send cursor rows using the binary protocol.
 */
@@ -949,11 +952,67 @@ static bool insert_bulk_params(Prepared_statement *stmt,
   DBUG_RETURN(0);
 }
 
-static bool set_conversion_functions(Prepared_statement *stmt,
-                                     uchar **data, uchar *data_end)
+/**
+  Checking if parameter type and flags are valid
+  @param typecode - ushort value with type in low byte, and flags in high byte
+*/
+bool
+parameter_type_sanity_check(ushort typecode)
+{
+  /* Checking if type in lower byte is valid */
+  switch (typecode & 0xff) {
+  case MYSQL_TYPE_DECIMAL:
+  case MYSQL_TYPE_NEWDECIMAL:
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_YEAR:
+  case MYSQL_TYPE_BIT:
+  case MYSQL_TYPE_FLOAT:
+  case MYSQL_TYPE_DOUBLE:
+  case MYSQL_TYPE_NULL:
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_TINY_BLOB:
+  case MYSQL_TYPE_MEDIUM_BLOB:
+  case MYSQL_TYPE_LONG_BLOB:
+  case MYSQL_TYPE_BLOB:
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_STRING:
+  case MYSQL_TYPE_ENUM:
+  case MYSQL_TYPE_SET:
+  case MYSQL_TYPE_GEOMETRY:
+  case MYSQL_TYPE_TIMESTAMP:
+  case MYSQL_TYPE_DATE:
+  case MYSQL_TYPE_TIME:
+  case MYSQL_TYPE_DATETIME:
+  // This types normally cannot be sent by client, so maybe it'd be better to treat them like an error here
+  case MYSQL_TYPE_TIMESTAMP2:
+  case MYSQL_TYPE_TIME2:
+  case MYSQL_TYPE_DATETIME2:
+  case MYSQL_TYPE_NEWDATE:
+  case MYSQL_TYPE_VARCHAR_COMPRESSED:
+  case MYSQL_TYPE_BLOB_COMPRESSED:
+    break;
+  default:
+    return true;
+  };
+ 
+  // In Flags in high byte only unsigned bit may be set
+  if (typecode & ((~parameter_flag_unsigned) & 0x0000ff00))
+  {
+    return true;
+  }
+  return false;
+}
+
+static bool 
+set_conversion_functions(Prepared_statement *stmt,
+                         uchar **data, uchar *data_end)
 {
   uchar *read_pos= *data;
-  const uint signed_bit= 1 << 15;
+  
   DBUG_ENTER("set_conversion_functions");
   /*
      First execute or types altered by the client, setup the
@@ -966,12 +1025,15 @@ static bool set_conversion_functions(Prepared_statement *stmt,
   {
     ushort typecode;
 
-    if (read_pos >= data_end)
-      DBUG_RETURN(1);
-
+    /* stmt_execute_packet_sanity_check has already verified, that there are enough data in the packet for data types */
     typecode= sint2korr(read_pos);
     read_pos+= 2;
-    (**it).unsigned_flag= MY_TEST(typecode & signed_bit);
+
+    if (parameter_type_sanity_check(typecode))
+    {
+      DBUG_RETURN(1);
+    }
+    (**it).unsigned_flag= MY_TEST(typecode & parameter_flag_unsigned);
     (*it)->setup_conversion(thd, (uchar) (typecode & 0xff));
     (*it)->sync_clones();
   }
@@ -3126,11 +3188,20 @@ static void mysql_stmt_execute_common(THD *thd,
 
 void mysqld_stmt_execute(THD *thd, char *packet_arg, uint packet_length)
 {
+  const uint packet_min_lenght= 9;
   uchar *packet= (uchar*)packet_arg; // GCC 4.0.1 workaround
+
+  DBUG_ENTER("mysqld_stmt_execute");
+
+  if (packet_length < packet_min_lenght)
+  {
+    my_error(ER_MALFORMED_PACKET, MYF(0), 0,
+      "", "mysqld_stmt_execute");
+    DBUG_VOID_RETURN;
+  }
   ulong stmt_id= uint4korr(packet);
   ulong flags= (ulong) packet[4];
   uchar *packet_end= packet + packet_length;
-  DBUG_ENTER("mysqld_stmt_execute");
 
   packet+= 9;                               /* stmt_id + 5 bytes of flags */
 
@@ -3186,7 +3257,54 @@ void mysqld_stmt_bulk_execute(THD *thd, char *packet_arg, uint packet_length)
   DBUG_VOID_RETURN;
 }
 
+/**
+Additional packet checks for direct execution
 
+@param thd             THD handle
+@param stmt            prepared statement being directly executed
+@param paket           packet with parameters to bind
+@param packet_end      pointer to the byte after parameters end
+@param bulk_op         is it bulk operation
+@param direct_exec     is it direct execution
+*/
+bool stmt_execute_packet_sanity_check(Prepared_statement *stmt, uchar *packet, uchar *packet_end, bool bulk_op, bool direct_exec)
+{
+  if (stmt->param_count > 0)
+  {
+    uint packet_length= packet_end - packet;
+    uint null_bitmap_bytes= (uint)(bulk_op ? 0 : (stmt->param_count + 7)/8);
+    uint min_len_for_param_count = null_bitmap_bytes
+                                 + 1;               /* sent types byte */
+
+    if (packet_length >= min_len_for_param_count)
+    {
+      if (!bulk_op && packet[null_bitmap_bytes])
+      {
+        /* Should be 0 or 1. If the byte is not 1, that could mean,
+           e.g. that we read incorrect byte due to incorrect number of sent parameters for direct execution
+           (i.e. null bitmap is shorter or longer, than it should be) */
+        if (packet[null_bitmap_bytes] != '\1')
+        {
+          return true;
+        }
+        min_len_for_param_count+= 2*stmt->param_count; /* 2 bytes per parameter of the type and flags */
+      }
+      else /* If types are not sent, there is nothing to do here. But for direct execution types should always be sent */
+      {
+        return direct_exec;
+      }
+    }
+
+    /* If true, the packet is guaranteed too short for the number of parameters in the PS */
+    return (packet_length < min_len_for_param_count);
+  }
+  else
+  {
+    /* If there is no parameters, this should be normally already end of the packet. If it's not - then error */
+    return (packet_end > packet);
+  }
+  return false;
+}
 /**
   Common part of prepared statement execution
 
@@ -3225,6 +3343,20 @@ static void mysql_stmt_execute_common(THD *thd,
              llstr(stmt_id, llbuf), "mysqld_stmt_execute");
     DBUG_VOID_RETURN;
   }
+
+  /*
+  * In case of direct execution application decides how many parameters to send.
+  * Thus extra checks are reuqired to prevent crashes caused by incorrect interpretation of
+  * the packet data. Plus there can be always a broken evil client.
+  */
+  if (stmt_execute_packet_sanity_check(stmt, packet, packet_end, bulk_op, stmt_id == LAST_STMT_ID))
+  {
+    char llbuf[22];
+    my_error(ER_MALFORMED_PACKET, MYF(0), static_cast<int>(sizeof(llbuf)),
+             llstr(stmt_id, llbuf), "mysqld_stmt_execute");
+    DBUG_VOID_RETURN;
+  }
+
   stmt->read_types= read_types;
 
 #if defined(ENABLED_PROFILING)
