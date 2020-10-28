@@ -3675,8 +3675,6 @@ static bool show_status_array(THD *thd, const char *wild,
   CHARSET_INFO *charset= system_charset_info;
   DBUG_ENTER("show_status_array");
 
-  thd->count_cuted_fields= CHECK_FIELD_WARN;
-
   prefix_end=strnmov(name_buffer, prefix, sizeof(name_buffer)-1);
   if (*prefix)
     *prefix_end++= '_';
@@ -3776,6 +3774,8 @@ static bool show_status_array(THD *thd, const char *wild,
         pos= get_one_variable(thd, var, scope, show_type, status_var,
                               &charset, buff, &length);
 
+        if (table->field[1]->field_length)
+          thd->count_cuted_fields= CHECK_FIELD_WARN;
         table->field[1]->store(pos, (uint32) length, charset);
         thd->count_cuted_fields= CHECK_FIELD_IGNORE;
         table->field[1]->set_notnull();
@@ -8046,51 +8046,6 @@ ST_SCHEMA_TABLE *get_schema_table(enum enum_schema_tables schema_table_idx)
   return &schema_tables[schema_table_idx];
 }
 
-static void
-mark_all_fields_used_in_query(THD *thd,
-                              ST_FIELD_INFO *schema_fields,
-                              MY_BITMAP *bitmap,
-                              Item *all_items)
-{
-  Item *item;
-  DBUG_ENTER("mark_all_fields_used_in_query");
-
-  /* If not SELECT command, return all columns */
-  if (thd->lex->sql_command != SQLCOM_SELECT &&
-      thd->lex->sql_command != SQLCOM_SET_OPTION)
-  {
-    bitmap_set_all(bitmap);
-    DBUG_VOID_RETURN;
-  }
-
-  for (item= all_items ; item ; item= item->next)
-  {
-    if (item->type() == Item::FIELD_ITEM)
-    {
-      ST_FIELD_INFO *fields= schema_fields;
-      uint count;
-      Item_field *item_field= (Item_field*) item;
-
-      /* item_field can be '*' as this function is called before fix_fields */
-      if (item_field->field_name.str == star_clex_str.str)
-      {
-        bitmap_set_all(bitmap);
-        break;
-      }
-      for (count=0; !fields->end_marker(); fields++, count++)
-      {
-        if (!my_strcasecmp(system_charset_info, fields->name().str,
-                           item_field->field_name.str))
-        {
-          bitmap_set_bit(bitmap, count);
-          break;
-        }
-      }
-    }
-  }
-  DBUG_VOID_RETURN;
-}
-
 /**
   Create information_schema table using schema_table data.
 
@@ -8103,7 +8058,7 @@ mark_all_fields_used_in_query(THD *thd,
     0<decimals<10 and 0<=length<100 .
 
   @param
-    thd	       	          thread handler
+    thd                   thread handler
 
   @param table_list Used to pass I_S table information(fields info, tables
   parameters etc) and table name.
@@ -8115,15 +8070,28 @@ mark_all_fields_used_in_query(THD *thd,
 TABLE *create_schema_table(THD *thd, TABLE_LIST *table_list)
 {
   uint field_count;
-  Item *all_items;
   TABLE *table;
   ST_SCHEMA_TABLE *schema_table= table_list->schema_table;
   ST_FIELD_INFO *fields_info= schema_table->fields_info;
+<<<<<<< HEAD
   ST_FIELD_INFO *fields;
   MY_BITMAP bitmap;
   my_bitmap_map *buf;
+||||||| 9868253b328
+  ST_FIELD_INFO *fields;
+  CHARSET_INFO *cs= system_charset_info;
+  MEM_ROOT *mem_root= thd->mem_root;
+  MY_BITMAP bitmap;
+  my_bitmap_map *buf;
+=======
+  CHARSET_INFO *cs= system_charset_info;
+  MEM_ROOT *mem_root= thd->mem_root;
+  bool need_all_fieds= table_list->schema_table_reformed || // SHOW command
+                       thd->lex->only_view_structure(); // need table structure
+>>>>>>> origin/bb-10.4-release
   DBUG_ENTER("create_schema_table");
 
+<<<<<<< HEAD
   for (field_count= 0, fields= fields_info; !fields->end_marker(); fields++)
     field_count++;
   if (!(buf= (my_bitmap_map*) thd->alloc(bitmap_buffer_size(field_count))))
@@ -8141,6 +8109,239 @@ TABLE *create_schema_table(THD *thd, TABLE_LIST *table_list)
   else
     mark_all_fields_used_in_query(thd, fields_info, &bitmap, all_items);
 
+||||||| 9868253b328
+  for (field_count= 0, fields= fields_info; fields->field_name; fields++)
+    field_count++;
+  if (!(buf= (my_bitmap_map*) thd->alloc(bitmap_buffer_size(field_count))))
+    DBUG_RETURN(NULL);
+  my_bitmap_init(&bitmap, buf, field_count, 0);
+
+  if (!thd->stmt_arena->is_conventional() &&
+      thd->mem_root != thd->stmt_arena->mem_root)
+    all_items= thd->stmt_arena->free_list;
+  else
+    all_items= thd->free_list;
+
+  if (table_list->part_of_natural_join)
+    bitmap_set_all(&bitmap);
+  else
+    mark_all_fields_used_in_query(thd, fields_info, &bitmap, all_items);
+
+  for (field_count=0; fields_info->field_name; fields_info++)
+  {
+    size_t field_name_length= strlen(fields_info->field_name);
+    switch (fields_info->field_type) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_INT24:
+      if (!(item= new (mem_root)
+            Item_return_int(thd, fields_info->field_name,
+                            fields_info->field_length,
+                            fields_info->field_type,
+                            fields_info->value)))
+      {
+        DBUG_RETURN(0);
+      }
+      item->unsigned_flag= (fields_info->field_flags & MY_I_S_UNSIGNED);
+      break;
+    case MYSQL_TYPE_DATE:
+      if (!(item=new (mem_root)
+            Item_return_date_time(thd, fields_info->field_name,
+                                  (uint)field_name_length,
+                                  fields_info->field_type)))
+        DBUG_RETURN(0);
+      break;
+    case MYSQL_TYPE_TIME:
+      if (!(item=new (mem_root)
+            Item_return_date_time(thd, fields_info->field_name,
+                                  (uint)field_name_length,
+                                  fields_info->field_type)))
+        DBUG_RETURN(0);
+      break;
+    case MYSQL_TYPE_TIMESTAMP:
+    case MYSQL_TYPE_DATETIME:
+      if (!(item=new (mem_root)
+            Item_return_date_time(thd, fields_info->field_name,
+                                  (uint)field_name_length,
+                                  fields_info->field_type,
+                                  fields_info->field_length)))
+        DBUG_RETURN(0);
+      item->decimals= fields_info->field_length;
+      break;
+    case MYSQL_TYPE_FLOAT:
+    case MYSQL_TYPE_DOUBLE:
+      if ((item= new (mem_root)
+           Item_float(thd, fields_info->field_name, 0.0,
+                      NOT_FIXED_DEC,
+                      fields_info->field_length)) == NULL)
+        DBUG_RETURN(NULL);
+      break;
+    case MYSQL_TYPE_DECIMAL:
+    case MYSQL_TYPE_NEWDECIMAL:
+      if (!(item= new (mem_root)
+            Item_decimal(thd, (longlong) fields_info->value, false)))
+      {
+        DBUG_RETURN(0);
+      }
+      /*
+        Create a type holder, as we want the type of the item to defined
+        the type of the object, not the value
+      */
+      if (!(item= new (mem_root) Item_type_holder(thd, item)))
+        DBUG_RETURN(0);
+      item->unsigned_flag= (fields_info->field_flags & MY_I_S_UNSIGNED);
+      item->decimals= fields_info->field_length%10;
+      item->max_length= (fields_info->field_length/100)%100;
+      if (item->unsigned_flag == 0)
+        item->max_length+= 1;
+      if (item->decimals > 0)
+        item->max_length+= 1;
+      item->set_name(thd, fields_info->field_name, field_name_length, cs);
+      break;
+    case MYSQL_TYPE_TINY_BLOB:
+    case MYSQL_TYPE_MEDIUM_BLOB:
+    case MYSQL_TYPE_LONG_BLOB:
+    case MYSQL_TYPE_BLOB:
+      if (bitmap_is_set(&bitmap, field_count))
+      {
+        if (!(item= new (mem_root)
+              Item_blob(thd, fields_info->field_name,
+                        fields_info->field_length)))
+        {
+          DBUG_RETURN(0);
+        }
+      }
+      else
+      {
+        if (!(item= new (mem_root)
+              Item_empty_string(thd, "", 0, cs)))
+        {
+          DBUG_RETURN(0);
+        }
+        item->set_name(thd, fields_info->field_name,
+                       field_name_length, cs);
+      }
+      break;
+    default:
+    {
+      bool show_field;
+      /* Don't let unimplemented types pass through. Could be a grave error. */
+      DBUG_ASSERT(fields_info->field_type == MYSQL_TYPE_STRING);
+
+      show_field= bitmap_is_set(&bitmap, field_count);
+      if (!(item= new (mem_root)
+            Item_empty_string(thd, "",
+                              show_field ? fields_info->field_length : 0, cs)))
+      {
+        DBUG_RETURN(0);
+      }
+      item->set_name(thd, fields_info->field_name,
+                     field_name_length, cs);
+      break;
+    }
+    }
+    field_list.push_back(item, thd->mem_root);
+    item->maybe_null= (fields_info->field_flags & MY_I_S_MAYBE_NULL);
+    field_count++;
+  }
+=======
+  for (; fields_info->field_name; fields_info++)
+  {
+    size_t field_name_length= strlen(fields_info->field_name);
+    switch (fields_info->field_type) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_INT24:
+      if (!(item= new (mem_root)
+            Item_return_int(thd, fields_info->field_name,
+                            fields_info->field_length,
+                            fields_info->field_type,
+                            fields_info->value)))
+      {
+        DBUG_RETURN(0);
+      }
+      item->unsigned_flag= (fields_info->field_flags & MY_I_S_UNSIGNED);
+      break;
+    case MYSQL_TYPE_DATE:
+      if (!(item=new (mem_root)
+            Item_return_date_time(thd, fields_info->field_name,
+                                  (uint)field_name_length,
+                                  fields_info->field_type)))
+        DBUG_RETURN(0);
+      break;
+    case MYSQL_TYPE_TIME:
+      if (!(item=new (mem_root)
+            Item_return_date_time(thd, fields_info->field_name,
+                                  (uint)field_name_length,
+                                  fields_info->field_type)))
+        DBUG_RETURN(0);
+      break;
+    case MYSQL_TYPE_TIMESTAMP:
+    case MYSQL_TYPE_DATETIME:
+      if (!(item=new (mem_root)
+            Item_return_date_time(thd, fields_info->field_name,
+                                  (uint)field_name_length,
+                                  fields_info->field_type,
+                                  fields_info->field_length)))
+        DBUG_RETURN(0);
+      item->decimals= fields_info->field_length;
+      break;
+    case MYSQL_TYPE_FLOAT:
+    case MYSQL_TYPE_DOUBLE:
+      if ((item= new (mem_root)
+           Item_float(thd, fields_info->field_name, 0.0,
+                      NOT_FIXED_DEC,
+                      fields_info->field_length)) == NULL)
+        DBUG_RETURN(NULL);
+      break;
+    case MYSQL_TYPE_DECIMAL:
+    case MYSQL_TYPE_NEWDECIMAL:
+      if (!(item= new (mem_root)
+            Item_decimal(thd, (longlong) fields_info->value, false)))
+      {
+        DBUG_RETURN(0);
+      }
+      /*
+        Create a type holder, as we want the type of the item to defined
+        the type of the object, not the value
+      */
+      if (!(item= new (mem_root) Item_type_holder(thd, item)))
+        DBUG_RETURN(0);
+      item->unsigned_flag= (fields_info->field_flags & MY_I_S_UNSIGNED);
+      item->decimals= fields_info->field_length%10;
+      item->max_length= (fields_info->field_length/100)%100;
+      if (item->unsigned_flag == 0)
+        item->max_length+= 1;
+      if (item->decimals > 0)
+        item->max_length+= 1;
+      item->set_name(thd, fields_info->field_name, field_name_length, cs);
+      break;
+    case MYSQL_TYPE_TINY_BLOB:
+    case MYSQL_TYPE_MEDIUM_BLOB:
+    case MYSQL_TYPE_LONG_BLOB:
+    case MYSQL_TYPE_BLOB:
+      if (!(item= new (mem_root) Item_blob(thd, fields_info->field_name,
+                                           fields_info->field_length)))
+        DBUG_RETURN(0);
+      break;
+    default:
+      /* Don't let unimplemented types pass through. Could be a grave error. */
+      DBUG_ASSERT(fields_info->field_type == MYSQL_TYPE_STRING);
+      if (!(item= new (mem_root) Item_empty_string(thd, "",
+                                               fields_info->field_length, cs)))
+        DBUG_RETURN(0);
+      item->set_name(thd, fields_info->field_name, field_name_length, cs);
+      break;
+    }
+    field_list.push_back(item, thd->mem_root);
+    item->maybe_null= (fields_info->field_flags & MY_I_S_MAYBE_NULL);
+    field_count++;
+  }
+>>>>>>> origin/bb-10.4-release
   TMP_TABLE_PARAM *tmp_table_param = new (thd->mem_root) TMP_TABLE_PARAM;
   tmp_table_param->init();
   tmp_table_param->table_charset= system_charset_info;
@@ -8148,6 +8349,7 @@ TABLE *create_schema_table(THD *thd, TABLE_LIST *table_list)
   tmp_table_param->schema_table= 1;
   SELECT_LEX *select_lex= table_list->select_lex;
   bool keep_row_order= is_show_command(thd);
+<<<<<<< HEAD
   if (!(table= create_tmp_table_for_schema(thd, tmp_table_param,
                                            *schema_table, bitmap,
                                            (select_lex->options |
@@ -8155,6 +8357,18 @@ TABLE *create_schema_table(THD *thd, TABLE_LIST *table_list)
                                             TMP_TABLE_ALL_COLUMNS),
                                             table_list->alias,
                                             keep_row_order)))
+||||||| 9868253b328
+  if (!(table= create_tmp_table(thd, tmp_table_param,
+                                field_list, (ORDER*) 0, 0, 0, 
+                                (select_lex->options | thd->variables.option_bits |
+                                 TMP_TABLE_ALL_COLUMNS), HA_POS_ERROR,
+                                &table_list->alias, false, keep_row_order)))
+=======
+  if (!(table= create_tmp_table(thd, tmp_table_param, field_list, (ORDER*) 0, 0,
+                 0, (select_lex->options | thd->variables.option_bits |
+                 TMP_TABLE_ALL_COLUMNS), HA_POS_ERROR,
+                 &table_list->alias, !need_all_fieds, keep_row_order)))
+>>>>>>> origin/bb-10.4-release
     DBUG_RETURN(0);
   my_bitmap_map* bitmaps=
     (my_bitmap_map*) thd->alloc(bitmap_buffer_size(field_count));
@@ -8546,6 +8760,67 @@ end:
 }
 
 
+static int optimize_schema_tables_memory_usage(TABLE_LIST *table_list)
+{
+  TABLE *table= table_list->table;
+  THD *thd=table->in_use;
+  if (!table->is_created())
+  {
+    TMP_TABLE_PARAM *p= table_list->schema_table_param;
+    TMP_ENGINE_COLUMNDEF *from_recinfo, *to_recinfo;
+    DBUG_ASSERT(table->s->keys == 0);
+    DBUG_ASSERT(table->s->uniques == 0);
+
+    // XXX HACK HACK HACK: in a stored function, RETURN (SELECT ...)
+    // enables warnings (in THD::sp_eval_expr) for the whole val_xxx/store pair,
+    // while the intention is to warn only for store(). Until this is
+    // fixed let's avoid data truncation warnings in I_S->fill_table()
+    if (thd->count_cuted_fields == CHECK_FIELD_IGNORE)
+    {
+
+    uchar *cur= table->field[0]->ptr;
+    /* first recinfo could be a NULL bitmap, not an actual Field */
+    from_recinfo= to_recinfo= p->start_recinfo + (cur != table->record[0]);
+    for (uint i=0; i < table->s->fields; i++, from_recinfo++)
+    {
+      Field *field= table->field[i];
+      DBUG_ASSERT(field->vcol_info == 0);
+      DBUG_ASSERT(from_recinfo->length= field->pack_length_in_rec());
+      if (bitmap_is_set(table->read_set, i))
+      {
+        field->move_field(cur);
+        *to_recinfo++= *from_recinfo;
+        cur+= from_recinfo->length;
+      }
+      else
+      {
+        field= new (thd->mem_root) Field_string(cur, 0, field->null_ptr,
+                              field->null_bit, Field::NONE,
+                              &field->field_name, field->dtcollation());
+        field->init(table);
+        field->field_index= i;
+        DBUG_ASSERT(field->pack_length_in_rec() == 0);
+        table->field[i]= field;
+      }
+    }
+    if ((table->s->reclength= (ulong)(cur - table->record[0])) == 0)
+    {
+      /* all fields were optimized away. Force a non-0-length row */
+      table->s->reclength= to_recinfo->length= 1;
+      to_recinfo++;
+    }
+    p->recinfo= to_recinfo;
+    } // XXX end of HACK HACK HACK
+
+    // TODO switch from Aria to Memory if all blobs were optimized away?
+    if (instantiate_tmp_table(table, p->keyinfo, p->start_recinfo, &p->recinfo,
+                 table_list->select_lex->options | thd->variables.option_bits))
+      return 1;
+  }
+  return 0;
+}
+
+
 /*
   This is the optimizer part of get_schema_tables_result().
 */
@@ -8566,6 +8841,9 @@ bool optimize_schema_tables_reads(JOIN *join)
     TABLE_LIST *table_list= tab->table->pos_in_table_list;
     if (table_list->schema_table && thd->fill_information_schema_tables())
     {
+      if (optimize_schema_tables_memory_usage(table_list))
+        DBUG_RETURN(1);
+
       /* A value of 0 indicates a dummy implementation */
       if (table_list->schema_table->fill_table == 0)
         continue;
@@ -8588,10 +8866,10 @@ bool optimize_schema_tables_reads(JOIN *join)
         cond= tab->cache_select->cond;
       }
       if (optimize_for_get_all_tables(thd, table_list, cond))
-        DBUG_RETURN(TRUE);   // Handle OOM
+        DBUG_RETURN(1);   // Handle OOM
     }
   }
-  DBUG_RETURN(FALSE);
+  DBUG_RETURN(0);
 }
 
 
@@ -8656,13 +8934,10 @@ bool get_schema_tables_result(JOIN *join,
         continue;
 
       /*
-        If schema table is already processed and
-        the statement is not a subselect then
-        we don't need to fill this table again.
-        If schema table is already processed and
-        schema_table_state != executed_place then
-        table is already processed and
-        we should skip second data processing.
+        If schema table is already processed and the statement is not a
+        subselect then we don't need to fill this table again. If schema table
+        is already processed and schema_table_state != executed_place then
+        table is already processed and we should skip second data processing.
       */
       if (table_list->schema_table_state &&
           (!is_subselect || table_list->schema_table_state != executed_place))
@@ -8724,8 +8999,7 @@ bool get_schema_tables_result(JOIN *join,
       It also means that an audit plugin cannot process the error correctly
       either. See also thd->clear_error()
     */
-    thd->get_stmt_da()->push_warning(thd,
-                                     thd->get_stmt_da()->sql_errno(),
+    thd->get_stmt_da()->push_warning(thd, thd->get_stmt_da()->sql_errno(),
                                      thd->get_stmt_da()->get_sqlstate(),
                                      Sql_condition::WARN_LEVEL_ERROR,
                                      thd->get_stmt_da()->message());
